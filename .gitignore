@@ -1,0 +1,7 @@
+# 设置文件含 API Key，绝不能进仓库
+settings.json
+settings.json.tmp
+settings.json.bak
+
+node_modules/
+*.log
