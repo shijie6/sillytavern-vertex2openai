@@ -48,6 +48,34 @@ grep enableServerPlugins config.yaml
 cd plugins && git clone <本仓库地址> vertex2openai
 ```
 
+### 装成功但没生效？
+
+服务端插件**在「扩展」面板里没有开关**，别去找它。它只有两个状态：文件在不在 `plugins/` 目录里，以及 `enableServerPlugins` 开没开。三者缺一都不会加载，且界面上不会有任何提示。
+
+按顺序查：
+
+1. **看目录对不对。** 插件必须落在酒馆的 `plugins/` 下，路径形如
+
+   ```
+   <酒馆目录>/plugins/sillytavern-vertex2openai/index.mjs
+   ```
+
+   如果它被装进了 `public/scripts/extensions/third-party/`，那是 UI 扩展的位置，服务端永远不会加载它。手动挪过去即可。
+
+2. **看开关。** `config.yaml` 里必须是 `enableServerPlugins: true`，改完**重启酒馆**（不是刷新页面）。
+
+3. **看启动日志。** 重启后服务端控制台里搜这几个关键词，能直接定位：
+
+   | 日志 | 含义 |
+   |---|---|
+   | `Initializing plugin from .../index.mjs` | 加载成功 |
+   | `1 server plugin(s) are currently loaded` | 已生效 |
+   | `Failed to load plugin from ...` | 入口文件加载失败，括号里是具体报错 |
+   | `Failed to load plugin module; plugin info missing field` | `info` 缺 id/name/description |
+   | 以上全都搜不到 | `enableServerPlugins` 没开，或目录不对 |
+
+4. **确认更新拉到了。** `plugins/` 下是 git 仓库时，酒馆启动会自动 `git pull`。如果 SillyDroid 里没有 git 或网络不通，手动进目录 `git pull` 一次。
+
 ### 3. 填 Key
 
 浏览器打开（把端口换成你酒馆的端口）：

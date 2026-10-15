@@ -1,0 +1,12 @@
+{
+  "id": "vertex2openai",
+  "displayName": "Vertex2OpenAI (Gemini Express)",
+  "display_name": "Vertex2OpenAI (Gemini Express)",
+  "name": "Vertex2OpenAI (Gemini Express)",
+  "version": "1.0.0",
+  "description": "服务端插件。在 SillyTavern 进程内启动一个 OpenAI 兼容端点（默认 http://127.0.0.1:8050/v1），把请求转发到 Gemini / Vertex AI Express Mode，无需另外部署 Python 反代。需要 config.yaml 里 enableServerPlugins: true，安装后重启酒馆生效。",
+  "author": "shijie6",
+  "homePage": "https://github.com/shijie6/sillytavern-vertex2openai",
+  "type": "server-plugin",
+  "main": "index.mjs"
+}
