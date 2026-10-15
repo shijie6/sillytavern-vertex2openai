@@ -271,6 +271,43 @@ async function callCookieOnce(body, settings) {
     return { error: last || { status: 502, body: openaiError('Cookie 通道调用失败', 'server_error') } };
 }
 
+/**
+ * 极轻量探测某个模型在指定通道是否可用。
+ * 只取第一个凭证、限制输出长度，把配额消耗压到最低。
+ */
+async function probeModel(model, channel) {
+    const s = state.settings;
+    const ch = String(channel || s.channel || 'auto').toLowerCase();
+    const body = { model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16, stream: false };
+
+    const single = ch === 'cookie'
+        ? { ...s, cookies: parseCookies(s.cookies).slice(0, 1), expressKeys: [] }
+        : { ...s, expressKeys: parseKeyList(s.expressKeys).slice(0, 1) };
+
+    try {
+        const r = await callOnce(body, single, ch);
+        if (r.data) return { model, ok: true, channel: r.channel };
+        const msg = String(r.error?.body?.error?.message || '未知错误');
+        // Permission denied 且带 "or it may not exist" 时，多数情况是模型名在这个区域不存在，
+        // 不一定是 IAM 真的没授权 —— 分开提示，避免用户白白去改权限。
+        const kind = /not exist|may not exist/i.test(msg) ? '模型不存在'
+            : /exhausted|quota/i.test(msg) ? '配额耗尽'
+                : /permission denied|forbidden/i.test(msg) ? '权限不足'
+                    : /unauthorized|401|invalid credential/i.test(msg) ? '凭证失效'
+                        : '其他';
+        const hint = {
+            '模型不存在': '换个模型名，或确认该模型在你选的区域可用',
+            '配额耗尽': '账号本次配额用完了，等一段时间再试；也可以在 GCP 控制台「配额」页确认剩余额度',
+            '权限不足': 'Cookie 对应的 Google 账号在这个项目上缺少 aiplatform 权限，检查 IAM 绑定',
+            '凭证失效': 'Cookie 已过期，重新抓一次粘进来',
+            '其他': '看上游原始报错',
+        }[kind] || '';
+        return { model, ok: false, kind, hint, error: msg.slice(0, 200) };
+    } catch (err) {
+        return { model, ok: false, kind: '异常', hint: '请求没发出去，检查代理设置', error: err.message };
+    }
+}
+
 /** 非流式调用：按通道顺序尝试，前一个通道被限流/拒绝就换下一个。 */
 async function callOnce(body, settings, preferred = null) {
     const channels = resolveChannels(settings, preferred);
@@ -629,24 +666,48 @@ async function init(router) {
             || DEFAULT_SETTINGS.models[0];
         const channel = String(req.query?.channel || '').trim() || null;
         try {
+            const probe = await probeModel(model, channel);
+            if (!probe.ok) {
+                res.json({
+                    ok: false, model, channel, kind: probe.kind,
+                    hint: probe.hint, error: probe.error,
+                });
+                return;
+            }
             const result = await callOnce(
                 { model, messages: [{ role: 'user', content: '只回复两个字：收到' }], stream: false },
                 state.settings,
                 channel,
             );
-            if (result.error) {
-                res.json({ ok: false, error: result.error.body?.error?.message || '调用失败', model, channel });
-                return;
-            }
             const content = result.data?.choices?.[0]?.message?.content || '';
             res.json({
-                ok: true, model, channel: result.channel,
+                ok: true, model, channel: probe.channel || result.channel,
                 reply: content.trim().slice(0, 120),
             });
         } catch (err) {
             res.json({ ok: false, error: err.message, model, channel });
         }
     });
+    /**
+     * 批量探测：逐个试模型列表，返回每个模型在当前通道下是否可用。
+     * 只取第一个凭证、限制 16 token，尽量少烧配额 —— 但仍然是「发真请求」，
+     * 配额紧张时慎用。
+     */
+    router.post('/scan', async (req, res) => {
+        try {
+            const channel = String(req.body?.channel || '').trim() || null;
+            const models = parseKeyList(state.settings.models);
+            const results = [];
+            for (const model of models) {
+                const r = await probeModel(model, channel);
+                results.push(r);
+            }
+            res.json({ ok: true, channel: channel || state.settings.channel, results });
+        } catch (err) {
+            res.json({ ok: false, error: err.message });
+        }
+    });
+
     router.post('/restart', async (_req, res) => {
         try {
             await startServer();
