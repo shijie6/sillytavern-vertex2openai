@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadSettings, saveSettings, parseKeyList, splitLines, DEFAULT_SETTINGS, settingsPath } from './lib/config.mjs';
+import { loadSettings, saveSettings, parseKeyList, parseCookies, DEFAULT_SETTINGS, settingsPath } from './lib/config.mjs';
 import { buildGeminiPayload, geminiToOpenai, geminiChunkToDelta, openaiError } from './lib/convert.mjs';
 import { request, createSseSplitter } from './lib/upstream.mjs';
 import {
@@ -113,7 +113,7 @@ function authorized(req) {
 /** 按设置决定本次要试哪些通道（auto = 先 Express，被限流/拒绝时转 Cookie）。 */
 function resolveChannels(settings, preferred = null) {
     const keyCount = parseKeyList(settings.expressKeys).length;
-    const cookieCount = splitLines(settings.cookies).length;
+    const cookieCount = parseCookies(settings.cookies).length;
     const mode = (preferred && preferred !== 'auto')
         ? String(preferred).toLowerCase()
         : String(settings.channel || 'auto').toLowerCase();
@@ -183,7 +183,7 @@ function composeFromCookie({ text, reasoning, image, finishReason, usage }, mode
  * 该端点只回流式响应，所以这里把整段流累积起来再合成一次响应。
  */
 async function callCookieOnce(body, settings) {
-    const cookies = splitLines(settings.cookies);
+    const cookies = parseCookies(settings.cookies);
     if (cookies.length === 0) {
         return { error: { status: 401, body: openaiError('未配置 Cookie，请到插件设置页填写', 'authentication_error') } };
     }
@@ -359,7 +359,7 @@ async function streamViaExpress(built, settings, ctx) {
 
 /** Cookie 通道的流式实现（多 Cookie 轮换）。 */
 async function streamViaCookie(built, settings, ctx) {
-    const cookies = splitLines(settings.cookies);
+    const cookies = parseCookies(settings.cookies);
     if (cookies.length === 0) {
         return { status: 'fallback', error: { status: 401, body: openaiError('[cookie] 未配置 Cookie', 'authentication_error') } };
     }
@@ -521,7 +521,7 @@ async function handleRequest(req, res) {
             channel: resolveChannels(state.settings),
             configured: String(state.settings.channel || 'auto'),
             keys: parseKeyList(state.settings.expressKeys).length,
-            cookies: splitLines(state.settings.cookies).length,
+            cookies: parseCookies(state.settings.cookies).length,
             projectId: state.settings.projectId || null,
             cookieProjectId: state.settings.cookieProjectId || null,
             location: state.settings.location || null,
@@ -611,7 +611,7 @@ async function init(router) {
             merged.expressKeys = parseKeyList(merged.expressKeys);
             merged.models = parseKeyList(merged.models);
             // Cookie 只按行拆：它内部可能含逗号，按逗号切会把一条 Cookie 切成好几段
-            merged.cookies = splitLines(merged.cookies);
+            merged.cookies = parseCookies(merged.cookies);
             state.settings = merged;
             saveSettings(PLUGIN_DIR, merged);
             log('设置已保存到', settingsPath(PLUGIN_DIR));
