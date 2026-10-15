@@ -288,17 +288,24 @@ async function probeModel(model, channel) {
         const r = await callOnce(body, single, ch);
         if (r.data) return { model, ok: true, channel: r.channel };
         const msg = String(r.error?.body?.error?.message || '未知错误');
-        // Permission denied 且带 "or it may not exist" 时，多数情况是模型名在这个区域不存在，
-        // 不一定是 IAM 真的没授权 —— 分开提示，避免用户白白去改权限。
-        const kind = /not exist|may not exist/i.test(msg) ? '模型不存在'
+        // 判定顺序很关键：Vertex 对「模型在该区域不存在」也返回
+        // "Permission 'aiplatform.endpoints.predict' denied ... (or it may not exist)"，
+        // 句尾那句只是 Google 的固定后缀，不是判定依据。真正能区分的是
+        // 'aiplatform.endpoints.predict' 这个权限名 —— 出现它就是 IAM 授权问题。
+        const kind = /aiplatform\.[\w.]+'?\s*(denied|permission)|IAM_PERMISSION_DENIED/i.test(msg) ? '权限不足'
             : /exhausted|quota/i.test(msg) ? '配额耗尽'
-                : /permission denied|forbidden/i.test(msg) ? '权限不足'
-                    : /unauthorized|401|invalid credential/i.test(msg) ? '凭证失效'
-                        : '其他';
+                : /not found|not exist|may not exist/i.test(msg) ? '模型不存在'
+                    : /permission denied|forbidden/i.test(msg) ? '权限不足'
+                        : /unauthorized|401|invalid credential/i.test(msg) ? '凭证失效'
+                            : '其他';
         const hint = {
             '模型不存在': '换个模型名，或确认该模型在你选的区域可用',
             '配额耗尽': '账号本次配额用完了，等一段时间再试；也可以在 GCP 控制台「配额」页确认剩余额度',
-            '权限不足': 'Cookie 对应的 Google 账号在这个项目上缺少 aiplatform 权限，检查 IAM 绑定',
+            '权限不足': '这个身份在目标项目上没有被授予 aiplatform.endpoints.predict。'
+                + '常见两种情况：① Cookie 抓自另一个 Google 账号（浏览器多账号登录时很容易抓错）；'
+                + '② Vertex Express 快速模式的项目只给 express-mode 服务账号授权，人类账号没有该权限。'
+                + '去 GCP 控制台「IAM 与管理 → IAM」看你的邮箱是否带 Vertex AI User 角色；'
+                + '快速模式项目若不给改 IAM，就只能用 Express 通道。',
             '凭证失效': 'Cookie 已过期，重新抓一次粘进来',
             '其他': '看上游原始报错',
         }[kind] || '';
@@ -657,6 +664,30 @@ async function init(router) {
             res.status(500).json({ ok: false, error: err.message });
         }
     });
+    /**
+     * 运行状态。前端扩展用它做状态展示 —— 不能让浏览器直接去问 127.0.0.1:8050，
+     * 因为从别的设备打开酒馆时，页面里的 127.0.0.1 指的是浏览器所在机器，不是服务端。
+     */
+    router.get('/status', (_req, res) => {
+        const s = state.settings;
+        const port = Number(s.port) || 8050;
+        res.json({
+            ok: true,
+            listening: Boolean(state.server?.listening),
+            port,
+            host: s.host,
+            endpoint: `http://127.0.0.1:${port}/v1`,
+            channel: s.channel,
+            keys: parseKeyList(s.expressKeys).length,
+            cookies: parseCookies(s.cookies).length,
+            projectId: s.projectId,
+            cookieProjectId: s.cookieProjectId,
+            location: s.location,
+            proxy: s.proxyUrl,
+            models: parseKeyList(s.models),
+        });
+    });
+
     router.get('/selftest', async (req, res) => {
         const list = parseKeyList(state.settings.models);
         // 没指定模型时别默认挑列表第一个（gemini-4-argon 常常没额度，会让人误判成配置错了）
