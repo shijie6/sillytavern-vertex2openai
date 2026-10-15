@@ -86,6 +86,47 @@ http://<酒馆地址>/api/plugins/vertex2openai/settings
 
 只支持 HTTP 代理（Clash 的混合端口就是），不支持 SOCKS。
 
+## 两条通道：Express 与 Cookie
+
+Express（官方 API Key）被限流是常态，尤其是刚开通的试用额度。插件因此内置了第二条通道。
+
+| | Express | Cookie 直连 |
+|---|---|---|
+| 凭证 | Google 发的 API Key | 浏览器登录态的 Cookie |
+| 端点 | 官方 `aiplatform.googleapis.com` | Cloud Console 前端私有的 `batchGraphql` |
+| 配额 | API 配额池 | **网页端那一份，和 API 是分开算的** |
+| 稳定性 | 有官方兼容承诺 | 无承诺，Google 可能随时改签名或封掉 |
+| 安全 | 泄露只影响 API 调用 | **等同整个 Google 账号权限** |
+
+**设置里的「通道选择」：**
+
+- `自动`（推荐）——先走 Express，被限流或拒绝时**静默切到 Cookie**，酒馆完全感知不到
+- `只用 Express` / `只用 Cookie` —— 需要单独排查某条通道时选
+
+自动切换的判定：Express 返回非 200，或者上游报错但**还没吐出任何一个字**时才切。一旦开始输出内容就不再切换，避免半截回复。
+
+### 怎么拿 Cookie
+
+1. 电脑浏览器登录 `console.cloud.google.com`（必须是**已开通 Vertex AI / Express 试用**的那个 Google 账号）
+2. `F12` 打开开发者工具 → 「网络 Network」→ 随便触发一个请求（刷新页面即可）
+3. 点任意一条请求 → 右侧「标头 Headers」→ 请求头里找 **`cookie:`** 那一行
+4. **整条原样复制**，粘贴到设置页的 Cookie 框里（一行一条，可填多条轮换）
+
+必须包含 `SAPISID` 或 `__Secure-3PAPISID`，否则算不出认证头，插件会在设置页直接提示你。
+
+还需要填**项目 ID**（Cookie 通道必须有，留空会复用上面 Express 那个）。
+
+### Cookie 什么时候会失效
+
+退出 Google 登录、改密码、或者过一段时间都会失效，表现是**突然全部 401**。
+重新按上面的步骤抓一次粘进去即可，不用动别的设置。置页的 Cookie 框下方会实时显示「已填 N 条，均含 SAPISID」的校验结果。
+
+### 风险提示（认真看）
+
+- Cookie **等同完整的 Google 账号权限**，拿到它可以操作你的云资源。只放在自己的设备上，**不要发给别人、不要填进任何第三方服务**
+- 这是**未公开的私有接口**，GitHub 上同类项目都标注了「无兼容性承诺、可能违反 GCP 服务条款」。要不要用自己权衡
+- 插件不会把 Cookie 上传到任何地方，它只存在你设备上的 `settings.json`
+
 ## 关于「只吐思考、不出正文」
 
 SillyTavern 每次请求都会硬发 `reasoning_effort=xhigh`，会把 Gemini 3.x 的思考档位顶到最高，

@@ -15,9 +15,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadSettings, saveSettings, parseKeyList, DEFAULT_SETTINGS, settingsPath } from './lib/config.mjs';
+import { loadSettings, saveSettings, parseKeyList, splitLines, DEFAULT_SETTINGS, settingsPath } from './lib/config.mjs';
 import { buildGeminiPayload, geminiToOpenai, geminiChunkToDelta, openaiError } from './lib/convert.mjs';
 import { request, createSseSplitter } from './lib/upstream.mjs';
+import {
+    BATCH_GRAPHQL_URL, buildHeaders, buildBody, createJsonObjectSplitter,
+    extractChunk, isAuthError, validateCookie,
+} from './lib/cookie.mjs';
 import { renderSettingsPage } from './lib/page.mjs';
 
 const PLUGIN_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -106,16 +110,33 @@ function authorized(req) {
     return header.replace(/^Bearer\s+/i, '').trim() === expect;
 }
 
-/** 非流式调用，失败时依次换 Key 重试。 */
-async function callOnce(body, settings) {
+/** 按设置决定本次要试哪些通道（auto = 先 Express，被限流/拒绝时转 Cookie）。 */
+function resolveChannels(settings, preferred = null) {
+    const keyCount = parseKeyList(settings.expressKeys).length;
+    const cookieCount = splitLines(settings.cookies).length;
+    const mode = (preferred && preferred !== 'auto')
+        ? String(preferred).toLowerCase()
+        : String(settings.channel || 'auto').toLowerCase();
+
+    if (mode === 'express') return keyCount ? ['express'] : [];
+    if (mode === 'cookie') return cookieCount ? ['cookie'] : [];
+
+    const order = [];
+    if (keyCount) order.push('express');
+    if (cookieCount) order.push('cookie');
+    return order;
+}
+
+/** Express 通道（官方 API Key），多 Key 轮换。 */
+async function callExpressOnce(body, settings) {
     const keys = parseKeyList(settings.expressKeys);
     if (keys.length === 0) {
-        return { error: { status: 401, body: openaiError('未配置 Express API Key，请到插件设置页填写', 'authentication_error') } };
+        return { error: { status: 401, body: openaiError('未配置 Express API Key', 'authentication_error') } };
     }
 
     const { payload, modelName, prefillText } = buildGeminiPayload(body, settings);
     if (settings.debug) {
-        log('出站请求模型=', modelName, '配置=', JSON.stringify(payload.generationConfig || {}));
+        log('[express] 出站模型=', modelName, '配置=', JSON.stringify(payload.generationConfig || {}));
     }
 
     let last = null;
@@ -131,96 +152,363 @@ async function callOnce(body, settings) {
             });
             if (res.status !== 200) {
                 last = describeUpstreamError(res.status, res.body);
-                log(`调用 ${modelName} 返回 ${res.status}`);
+                log(`[express] ${modelName} 返回 ${res.status}`);
                 continue;
             }
-            return { data: geminiToOpenai(JSON.parse(res.body), modelName, prefillText), modelName };
+            return { data: geminiToOpenai(JSON.parse(res.body), modelName, prefillText), modelName, channel: 'express' };
         } catch (err) {
             last = { status: 502, body: openaiError(`请求上游失败：${err.message}`, 'server_error') };
-            log('请求异常：', err.message);
+            log('[express] 请求异常：', err.message);
         }
     }
     return { error: last || { status: 502, body: openaiError('上游调用失败', 'server_error') } };
 }
 
-/** 流式调用：把上游 SSE 逐帧转成 OpenAI 的 data: 帧写给客户端。 */
-async function callStream(body, settings, req, res) {
+/** 把 Cookie 通道累积出来的内容拼成 OpenAI 响应（复用 Express 那套转换，避免两套逻辑）。 */
+function composeFromCookie({ text, reasoning, image, finishReason, usage }, modelName, prefillText) {
+    const parts = [];
+    if (reasoning) parts.push({ text: reasoning, thought: true });
+    if (image) parts.push({ text: image });
+    if (text) parts.push({ text });
+
+    const fake = {
+        candidates: [{ content: { parts }, finishReason }],
+        usageMetadata: usage || {},
+    };
+    return geminiToOpenai(fake, modelName, prefillText);
+}
+
+/**
+ * Cookie 通道（batchGraphql），多 Cookie 轮换。
+ * 该端点只回流式响应，所以这里把整段流累积起来再合成一次响应。
+ */
+async function callCookieOnce(body, settings) {
+    const cookies = splitLines(settings.cookies);
+    if (cookies.length === 0) {
+        return { error: { status: 401, body: openaiError('未配置 Cookie，请到插件设置页填写', 'authentication_error') } };
+    }
+
+    const projectId = String(settings.cookieProjectId || settings.projectId || '').trim();
+    if (!projectId) {
+        return { error: { status: 400, body: openaiError('Cookie 通道必须填 GCP 项目 ID', 'invalid_request_error') } };
+    }
+
+    const { payload, modelName, prefillText, grounded } = buildGeminiPayload(body, settings);
+    const graphBody = buildBody({
+        projectId,
+        modelName,
+        contents: payload.contents,
+        systemInstruction: payload.systemInstruction,
+        generationConfig: payload.generationConfig || {},
+        grounded,
+        safetyThreshold: settings.cookieSafety || 'OFF',
+    });
+    if (settings.debug) {
+        log('[cookie] 出站模型=', modelName, '配置=', JSON.stringify(payload.generationConfig || {}));
+    }
+
+    let last = null;
+    for (const cookieStr of cookies) {
+        const headers = buildHeaders(cookieStr);
+        if (!headers) {
+            last = { status: 401, body: openaiError('这条 Cookie 里没有 SAPISID，算不出认证头', 'authentication_error') };
+            continue;
+        }
+
+        let text = '';
+        let reasoning = '';
+        let image = null;
+        let finishReason = null;
+        let usage = null;
+        let err = null;
+
+        try {
+            const splitter = createJsonObjectSplitter((obj) => {
+                const c = extractChunk(obj);
+                if (!c) return;
+                if (c.error) { err = c.error; return; }
+                if (c.blocked) { err = `被上游安全策略拦截：${c.blocked}`; return; }
+                text += c.text || '';
+                reasoning += c.reasoning || '';
+                if (c.finishReason) finishReason = c.finishReason;
+                if (c.usage) usage = c.usage;
+                if (c.image) image = c.image;
+            });
+
+            await request({
+                url: BATCH_GRAPHQL_URL,
+                method: 'POST',
+                headers,
+                body: JSON.stringify(graphBody),
+                proxyUrl: settings.proxyUrl || '',
+                timeoutMs: 180000,
+                onData: (chunk) => splitter.push(chunk),
+            });
+            splitter.flush();
+
+            if (err) {
+                last = {
+                    status: isAuthError(err) ? 401 : 502,
+                    body: openaiError(`[cookie] ${err}`, isAuthError(err) ? 'authentication_error' : 'server_error'),
+                };
+                log('[cookie] 上游报错：', String(err).slice(0, 160));
+                continue;
+            }
+            if (!text && !image) {
+                last = { status: 502, body: openaiError('[cookie] 上游没返回任何内容（Cookie 可能已失效）', 'server_error') };
+                continue;
+            }
+            return {
+                data: composeFromCookie({ text, reasoning, image, finishReason, usage }, modelName, prefillText),
+                modelName,
+                channel: 'cookie',
+            };
+        } catch (e) {
+            last = { status: 502, body: openaiError(`[cookie] 请求失败：${e.message}`, 'server_error') };
+            log('[cookie] 请求异常：', e.message);
+        }
+    }
+    return { error: last || { status: 502, body: openaiError('Cookie 通道调用失败', 'server_error') } };
+}
+
+/** 非流式调用：按通道顺序尝试，前一个通道被限流/拒绝就换下一个。 */
+async function callOnce(body, settings, preferred = null) {
+    const channels = resolveChannels(settings, preferred);
+    if (channels.length === 0) {
+        return { error: { status: 401, body: openaiError('既没配 Express API Key 也没配 Cookie，请到插件设置页填写', 'authentication_error') } };
+    }
+
+    let last = null;
+    for (const ch of channels) {
+        const r = ch === 'express'
+            ? await callExpressOnce(body, settings)
+            : await callCookieOnce(body, settings);
+        if (r.data) return r;
+        last = r.error;
+    }
+    return { error: last || { status: 502, body: openaiError('上游调用失败', 'server_error') } };
+}
+
+/** 把一个 Gemini 格式的增量块转成 OpenAI delta 并写出去。 */
+function emitGeminiChunk(chunk, ctx) {
+    const { delta, finishReason, usage } = geminiChunkToDelta(chunk, ctx.streamState);
+
+    if (usage) {
+        ctx.write({
+            id: ctx.id, object: 'chat.completion.chunk', created: ctx.created, model: ctx.modelName,
+            choices: [{ index: 0, delta: {}, finish_reason: null }],
+            usage: {
+                prompt_tokens: Number(usage.promptTokenCount || 0),
+                completion_tokens: Number(usage.candidatesTokenCount || 0),
+                total_tokens: Number(usage.totalTokenCount || 0),
+            },
+        });
+    }
+    if (Object.keys(delta).length === 0 && !finishReason) return;
+    ctx.write({
+        id: ctx.id, object: 'chat.completion.chunk', created: ctx.created, model: ctx.modelName,
+        choices: [{ index: 0, delta, finish_reason: finishReason }],
+    });
+}
+
+function finishStream(ctx) {
+    ctx.write({
+        id: ctx.id, object: 'chat.completion.chunk', created: ctx.created, model: ctx.modelName,
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+    });
+    ctx.writeRaw('data: [DONE]\n\n');
+    ctx.end();
+}
+
+/** Express 通道的流式实现。 */
+async function streamViaExpress(built, settings, ctx) {
     const keys = parseKeyList(settings.expressKeys);
     if (keys.length === 0) {
-        sendJson(res, 401, openaiError('未配置 Express API Key，请到插件设置页填写', 'authentication_error'));
+        return { status: 'fallback', error: { status: 401, body: openaiError('[express] 未配置 API Key', 'authentication_error') } };
+    }
+
+    let got = false;
+    try {
+        const splitter = createSseSplitter((chunk) => { got = true; emitGeminiChunk(chunk, ctx); });
+        await request({
+            url: upstreamUrl(built.modelName, true),
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': keys[0] },
+            body: JSON.stringify(built.payload),
+            proxyUrl: settings.proxyUrl || '',
+            timeoutMs: 300000,
+            onData: (chunk) => splitter.push(chunk),
+            signal: ctx.controller.signal,
+        });
+        splitter.flush();
+    } catch (err) {
+        if (got) {
+            ctx.writeErr(err.message);
+            ctx.end();
+            return { status: 'done' };
+        }
+        return { status: 'fallback', error: { status: 502, body: openaiError(`[express] ${err.message}`, 'server_error') } };
+    }
+
+    if (!got) {
+        return { status: 'fallback', error: { status: 502, body: openaiError('[express] 上游没有返回任何内容', 'server_error') } };
+    }
+    finishStream(ctx);
+    return { status: 'done' };
+}
+
+/** Cookie 通道的流式实现（多 Cookie 轮换）。 */
+async function streamViaCookie(built, settings, ctx) {
+    const cookies = splitLines(settings.cookies);
+    if (cookies.length === 0) {
+        return { status: 'fallback', error: { status: 401, body: openaiError('[cookie] 未配置 Cookie', 'authentication_error') } };
+    }
+
+    const projectId = String(settings.cookieProjectId || settings.projectId || '').trim();
+    if (!projectId) {
+        return { status: 'fallback', error: { status: 400, body: openaiError('Cookie 通道必须填 GCP 项目 ID', 'invalid_request_error') } };
+    }
+
+    const graphBody = buildBody({
+        projectId,
+        modelName: built.modelName,
+        contents: built.payload.contents,
+        systemInstruction: built.payload.systemInstruction,
+        generationConfig: built.payload.generationConfig || {},
+        grounded: built.grounded,
+        safetyThreshold: settings.cookieSafety || 'OFF',
+    });
+
+    let last = null;
+    for (const cookieStr of cookies) {
+        const headers = buildHeaders(cookieStr);
+        if (!headers) {
+            last = { status: 401, body: openaiError('这条 Cookie 里没有 SAPISID，算不出认证头', 'authentication_error') };
+            continue;
+        }
+
+        let got = false;
+        let err = null;
+
+        try {
+            const splitter = createJsonObjectSplitter((obj) => {
+                const c = extractChunk(obj);
+                if (!c) return;
+                if (c.error) { err = c.error; return; }
+                if (c.blocked) { err = `被上游安全策略拦截：${c.blocked}`; return; }
+
+                const parts = [];
+                if (c.reasoning) parts.push({ text: c.reasoning, thought: true });
+                if (c.image) parts.push({ text: c.image });
+                if (c.text) parts.push({ text: c.text });
+                if (parts.length === 0 && !c.finishReason && !c.usage) return;
+
+                got = true;
+                emitGeminiChunk({
+                    candidates: [{ content: { parts }, finishReason: c.finishReason }],
+                    usageMetadata: c.usage || undefined,
+                }, ctx);
+            });
+
+            await request({
+                url: BATCH_GRAPHQL_URL,
+                method: 'POST',
+                headers,
+                body: JSON.stringify(graphBody),
+                proxyUrl: settings.proxyUrl || '',
+                timeoutMs: 300000,
+                onData: (chunk) => splitter.push(chunk),
+                signal: ctx.controller.signal,
+            });
+            splitter.flush();
+
+            if (err) {
+                if (got) { ctx.writeErr(err); ctx.end(); return { status: 'done' }; }
+                last = {
+                    status: isAuthError(err) ? 401 : 502,
+                    body: openaiError(`[cookie] ${err}`, isAuthError(err) ? 'authentication_error' : 'server_error'),
+                };
+                log('[cookie] 上游报错：', String(err).slice(0, 160));
+                continue;
+            }
+            if (!got) {
+                last = { status: 502, body: openaiError('[cookie] 上游没返回任何内容（Cookie 可能已失效）', 'server_error') };
+                continue;
+            }
+            finishStream(ctx);
+            return { status: 'done' };
+        } catch (e) {
+            if (got) { ctx.writeErr(e.message); ctx.end(); return { status: 'done' }; }
+            last = { status: 502, body: openaiError(`[cookie] 请求失败：${e.message}`, 'server_error') };
+        }
+    }
+    return { status: 'fallback', error: last };
+}
+
+/**
+ * 流式调用。
+ *
+ * 响应头延迟到真的有内容时才发：这样第一个通道被限流/拒绝、但还没吐出一个字时，
+ * 可以静默切到下一个通道，客户端（酒馆）完全感知不到换过通道。
+ */
+async function callStream(body, settings, req, res) {
+    const channels = resolveChannels(settings);
+    if (channels.length === 0) {
+        sendJson(res, 401, openaiError('既没配 Express API Key 也没配 Cookie，请到插件设置页填写', 'authentication_error'));
         return;
     }
 
-    const { payload, modelName, prefillText } = buildGeminiPayload(body, settings);
-    const key = keys[0];
-    const streamState = { prefillText, prefillSent: false };
+    const built = buildGeminiPayload(body, settings);
     const id = `chatcmpl-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     const created = Math.floor(Date.now() / 1000);
 
-    res.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-        'X-Accel-Buffering': 'no',
-    });
-
-    let sentAny = false;
-    const write = (obj) => {
-        sentAny = true;
-        res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    let headSent = false;
+    const ensureHead = () => {
+        if (headSent) return;
+        headSent = true;
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no',
+        });
     };
 
     const controller = new AbortController();
     res.on('close', () => controller.abort());
 
-    try {
-        const splitter = createSseSplitter((chunk) => {
-            const { delta, finishReason, usage } = geminiChunkToDelta(chunk, streamState);
-            if (usage) {
-                write({
-                    id, object: 'chat.completion.chunk', created, model: modelName,
-                    choices: [{ index: 0, delta: {}, finish_reason: null }],
-                    usage: {
-                        prompt_tokens: Number(usage.promptTokenCount || 0),
-                        completion_tokens: Number(usage.candidatesTokenCount || 0),
-                        total_tokens: Number(usage.totalTokenCount || 0),
-                    },
-                });
-            }
-            if (Object.keys(delta).length === 0 && !finishReason) return;
-            write({
-                id, object: 'chat.completion.chunk', created, model: modelName,
-                choices: [{ index: 0, delta, finish_reason: finishReason }],
-            });
-        });
+    const ctx = {
+        id,
+        created,
+        modelName: built.modelName,
+        streamState: { prefillText: built.prefillText, prefillSent: false },
+        controller,
+        write: (obj) => { ensureHead(); res.write(`data: ${JSON.stringify(obj)}\n\n`); },
+        writeRaw: (s) => { ensureHead(); res.write(s); },
+        writeErr: (m) => ctx.write({ error: { message: m, type: 'server_error' } }),
+        end: () => res.end(),
+    };
 
-        await request({
-            url: upstreamUrl(modelName, true),
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-            body: JSON.stringify(payload),
-            proxyUrl: settings.proxyUrl || '',
-            timeoutMs: 300000,
-            onData: (chunk) => splitter.push(chunk),
-            signal: controller.signal,
-        });
-        splitter.flush();
+    let last = null;
+    for (const ch of channels) {
+        if (controller.signal.aborted) return;
 
-        write({ id, object: 'chat.completion.chunk', created, model: modelName, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
-        res.write('data: [DONE]\n\n');
-        res.end();
-    } catch (err) {
-        if (!controller.signal.aborted) {
-            log('流式调用异常：', err.message);
-        }
-        if (!sentAny) {
-            // 还没写出任何内容，可以正常返回错误 JSON
-            sendJson(res, 502, openaiError(`流式请求失败：${err.message}`, 'server_error'));
+        const r = ch === 'express'
+            ? await streamViaExpress(built, settings, ctx)
+            : await streamViaCookie(built, settings, ctx);
+
+        if (r.status === 'done') return;
+        last = r.error;
+        if (headSent) {
+            // 已经写过内容，没法再换通道了
+            ctx.writeErr(last.body?.error?.message || '上游调用失败');
+            ctx.end();
             return;
         }
-        res.write(`data: ${JSON.stringify({ error: { message: err.message, type: 'server_error' } })}\n\n`);
-        res.end();
     }
+
+    // 所有通道都失败，而且一个字节都没写出去 —— 可以正常返回错误码
+    sendJson(res, last?.status || 502, last?.body || openaiError('上游调用失败', 'server_error'));
 }
 
 async function handleRequest(req, res) {
@@ -228,11 +516,14 @@ async function handleRequest(req, res) {
     const route = url.pathname.replace(/\/+$/, '') || '/';
 
     if (route === '/health') {
-        const keys = parseKeyList(state.settings.expressKeys);
         sendJson(res, 200, {
             ok: true,
-            keys: keys.length,
+            channel: resolveChannels(state.settings),
+            configured: String(state.settings.channel || 'auto'),
+            keys: parseKeyList(state.settings.expressKeys).length,
+            cookies: splitLines(state.settings.cookies).length,
             projectId: state.settings.projectId || null,
+            cookieProjectId: state.settings.cookieProjectId || null,
             location: state.settings.location || null,
             proxy: state.settings.proxyUrl || null,
         });
@@ -319,6 +610,8 @@ async function init(router) {
             // 不清洗的话整块文本会被当成一个元素，酒馆拉到的模型 id 就是一坨。
             merged.expressKeys = parseKeyList(merged.expressKeys);
             merged.models = parseKeyList(merged.models);
+            // Cookie 只按行拆：它内部可能含逗号，按逗号切会把一条 Cookie 切成好几段
+            merged.cookies = splitLines(merged.cookies);
             state.settings = merged;
             saveSettings(PLUGIN_DIR, merged);
             log('设置已保存到', settingsPath(PLUGIN_DIR));
@@ -334,19 +627,24 @@ async function init(router) {
             || list.find(m => m === 'gemini-3.6-flash')
             || list[0]
             || DEFAULT_SETTINGS.models[0];
+        const channel = String(req.query?.channel || '').trim() || null;
         try {
             const result = await callOnce(
                 { model, messages: [{ role: 'user', content: '只回复两个字：收到' }], stream: false },
                 state.settings,
+                channel,
             );
             if (result.error) {
-                res.json({ ok: false, error: result.error.body?.error?.message || '调用失败', model });
+                res.json({ ok: false, error: result.error.body?.error?.message || '调用失败', model, channel });
                 return;
             }
             const content = result.data?.choices?.[0]?.message?.content || '';
-            res.json({ ok: true, model, reply: content.trim().slice(0, 120) });
+            res.json({
+                ok: true, model, channel: result.channel,
+                reply: content.trim().slice(0, 120),
+            });
         } catch (err) {
-            res.json({ ok: false, error: err.message, model });
+            res.json({ ok: false, error: err.message, model, channel });
         }
     });
     router.post('/restart', async (_req, res) => {

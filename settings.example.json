@@ -11,6 +11,10 @@
   "prefillSuppressThinking": true,
   "samplingPolicy": "auto",
   "prefillInstruction": "",
+  "channel": "auto",
+  "cookies": [],
+  "cookieProjectId": "",
+  "cookieSafety": "OFF",
   "models": [
     "gemini-4-argon",
     "gemini-3.8-flash",
