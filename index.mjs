@@ -315,12 +315,10 @@ async function init(router) {
             for (const key of Object.keys(DEFAULT_SETTINGS)) {
                 if (key in incoming) merged[key] = incoming[key];
             }
-            if (typeof merged.expressKeys === 'string') {
-                merged.expressKeys = parseKeyList(merged.expressKeys);
-            }
-            if (typeof merged.models === 'string') {
-                merged.models = parseKeyList(merged.models);
-            }
+            // 两个列表统一清洗：设置页是每行一个，粘贴进来的也可能带逗号或分号。
+            // 不清洗的话整块文本会被当成一个元素，酒馆拉到的模型 id 就是一坨。
+            merged.expressKeys = parseKeyList(merged.expressKeys);
+            merged.models = parseKeyList(merged.models);
             state.settings = merged;
             saveSettings(PLUGIN_DIR, merged);
             log('设置已保存到', settingsPath(PLUGIN_DIR));
@@ -330,8 +328,11 @@ async function init(router) {
         }
     });
     router.get('/selftest', async (req, res) => {
+        const list = parseKeyList(state.settings.models);
+        // 没指定模型时别默认挑列表第一个（gemini-4-argon 常常没额度，会让人误判成配置错了）
         const model = String(req.query?.model || '').trim()
-            || parseKeyList(state.settings.models)[0]
+            || list.find(m => m === 'gemini-3.6-flash')
+            || list[0]
             || DEFAULT_SETTINGS.models[0];
         try {
             const result = await callOnce(
